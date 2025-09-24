@@ -2,7 +2,8 @@ from flask import Flask, render_template, request, make_response, session, redir
 from flask_wtf import CSRFProtect
 import sqlite3
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
+import statistics
 import json
 import forms
 import functions
@@ -326,10 +327,209 @@ def dashboard():
             habitperformance=round(100/3+(habitperformance)/3)
         elif solver_category =="Completo":
             habitperformance=round(200/3+habitperformance/3)
-            
-        
     except:
         habitperformance=0
+
+    fatrate_target = fatrate
+    leanrate_target = leanrate
+
+    def safe_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def parse_date_safe(value):
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y"):
+                    try:
+                        return datetime.strptime(value, fmt)
+                    except ValueError:
+                        continue
+        return None
+
+    user_entries = []
+    for row in dinamicodata:
+        entry_date = parse_date_safe(row[2])
+        user_entries.append({
+            "date": entry_date,
+            "fat_mass": safe_float(row[10]),
+            "lean_mass": safe_float(row[11]),
+            "weight": safe_float(row[6]),
+            "lbm_category": row[21],
+            "fbm_category": row[23]
+        })
+
+    user_entries = [entry for entry in user_entries if entry["date"] is not None]
+    user_entries.sort(key=lambda item: item["date"])
+
+    latest_entry_date = user_entries[-1]["date"] if user_entries else datetime.today()
+
+    positive_lbmloss = {"Excelente", "Correcto", "Impresionante"}
+    positive_fbmgain = {"Excelente", "Correcto"}
+
+    def is_positive_entry(entry):
+        return (entry.get("lbm_category") in positive_lbmloss) or (entry.get("fbm_category") in positive_fbmgain)
+
+    def build_metrics(filtered_entries, baseline_entry, label):
+        metrics = {
+            "label": label,
+            "fat_rate": None,
+            "lean_rate": None,
+            "fat_diff": None,
+            "lean_diff": None,
+            "confidence": {
+                "count": len(filtered_entries),
+                "cv": None
+            }
+        }
+
+        weights = [entry["weight"] for entry in filtered_entries if entry["weight"] is not None]
+        if len(weights) > 1:
+            mean_weight = sum(weights) / len(weights)
+            if mean_weight:
+                metrics["confidence"]["cv"] = statistics.pstdev(weights) / mean_weight
+        elif len(weights) == 1:
+            metrics["confidence"]["cv"] = None
+
+        comparison_entries = []
+        if baseline_entry:
+            comparison_entries.append(baseline_entry)
+        comparison_entries.extend(filtered_entries)
+        comparison_entries = [entry for entry in comparison_entries if entry["date"] and entry["fat_mass"] is not None and entry["lean_mass"] is not None]
+
+        if len(comparison_entries) >= 2:
+            first_entry = comparison_entries[0]
+            last_entry = comparison_entries[-1]
+            delta_days = (last_entry["date"] - first_entry["date"]).days
+            if delta_days > 0:
+                fat_rate = (last_entry["fat_mass"] - first_entry["fat_mass"]) / delta_days * 7
+                lean_rate = (last_entry["lean_mass"] - first_entry["lean_mass"]) / delta_days * 7
+                metrics["fat_rate"] = fat_rate
+                metrics["lean_rate"] = lean_rate
+                if fatrate_target is not None:
+                    metrics["fat_diff"] = abs(fat_rate) - fatrate_target
+                if leanrate_target is not None:
+                    metrics["lean_diff"] = lean_rate - leanrate_target
+
+        return metrics
+
+    def prepare_entries(days, positive_only=False):
+        start_date = latest_entry_date - timedelta(days=days)
+        filtered = []
+        for entry in user_entries:
+            if entry["date"] >= start_date:
+                if positive_only and not is_positive_entry(entry):
+                    continue
+                filtered.append(entry)
+        baseline = None
+        if filtered:
+            for entry in reversed(user_entries):
+                if entry["date"] < filtered[0]["date"]:
+                    if positive_only and not is_positive_entry(entry):
+                        continue
+                    baseline = entry
+                    break
+        return filtered, baseline
+
+    performance_clock = {
+        "all": {
+            "label": "Todos los datos",
+            "timeframes": {}
+        },
+        "positive": {
+            "label": "Solo positivos (días adherentes)",
+            "timeframes": {}
+        },
+        "population": {
+            "label": "Promedio de la población (solver)",
+            "timeframes": {}
+        }
+    }
+
+    timeframes = [
+        ("week", 7, "Última semana"),
+        ("month", 30, "Último mes"),
+        ("year", 365, "Último año")
+    ]
+
+    population_connection = sqlite3.connect('src/Basededatos')
+    population_cursor = population_connection.cursor()
+
+    try:
+        for key, days, label in timeframes:
+            filtered_all, baseline_all = prepare_entries(days, positive_only=False)
+            metrics_all = build_metrics(filtered_all, baseline_all, label)
+            print(f"[DEBUG] Reloj rendimiento todos - {label}: fat_rate={metrics_all['fat_rate']}, lean_rate={metrics_all['lean_rate']}, count={metrics_all['confidence']['count']}, cv={metrics_all['confidence']['cv']}")
+            performance_clock["all"]["timeframes"][key] = metrics_all
+
+            filtered_positive, baseline_positive = prepare_entries(days, positive_only=True)
+            metrics_positive = build_metrics(filtered_positive, baseline_positive, label)
+            print(f"[DEBUG] Reloj rendimiento positivos - {label}: fat_rate={metrics_positive['fat_rate']}, lean_rate={metrics_positive['lean_rate']}, count={metrics_positive['confidence']['count']}, cv={metrics_positive['confidence']['cv']}")
+            performance_clock["positive"]["timeframes"][key] = metrics_positive
+
+            start_date = (latest_entry_date - timedelta(days=days)).strftime('%Y-%m-%d')
+            end_date = latest_entry_date.strftime('%Y-%m-%d')
+            population_cursor.execute(
+                """
+                SELECT FECHA_REGISTRO, PESO, PESO_GRASO, PESO_MAGRO, DELTAPG, DELTAPM, DELTADIA
+                FROM PERFILDINAMICO
+                WHERE FECHA_REGISTRO IS NOT NULL
+                  AND DATE(FECHA_REGISTRO) BETWEEN ? AND ?
+                  AND DELTADIA IS NOT NULL
+                """,
+                (start_date, end_date)
+            )
+            population_rows = population_cursor.fetchall()
+
+            population_metrics = {
+                "label": label,
+                "fat_rate": None,
+                "lean_rate": None,
+                "fat_diff": None,
+                "lean_diff": None,
+                "confidence": {
+                    "count": len(population_rows),
+                    "cv": None
+                }
+            }
+
+            population_weights = [safe_float(row[1]) for row in population_rows if safe_float(row[1]) is not None]
+            if len(population_weights) > 1:
+                mean_weight = sum(population_weights) / len(population_weights)
+                if mean_weight:
+                    population_metrics["confidence"]["cv"] = statistics.pstdev(population_weights) / mean_weight
+            elif len(population_weights) == 1:
+                population_metrics["confidence"]["cv"] = None
+
+            total_days = 0
+            total_fat_change = 0
+            total_lean_change = 0
+            for _, _, _, _, delta_fat, delta_lean, delta_days in population_rows:
+                if delta_days and delta_days > 0 and delta_fat is not None and delta_lean is not None:
+                    total_days += delta_days
+                    total_fat_change += delta_fat
+                    total_lean_change += delta_lean
+
+            if total_days > 0:
+                fat_rate_population = (total_fat_change / total_days) * 7
+                lean_rate_population = (total_lean_change / total_days) * 7
+                population_metrics["fat_rate"] = fat_rate_population
+                population_metrics["lean_rate"] = lean_rate_population
+                if fatrate_target is not None:
+                    population_metrics["fat_diff"] = abs(fat_rate_population) - fatrate_target
+                if leanrate_target is not None:
+                    population_metrics["lean_diff"] = lean_rate_population - leanrate_target
+
+            print(f"[DEBUG] Reloj rendimiento población - {label}: fat_rate={population_metrics['fat_rate']}, lean_rate={population_metrics['lean_rate']}, count={population_metrics['confidence']['count']}, cv={population_metrics['confidence']['cv']}")
+            performance_clock["population"]["timeframes"][key] = population_metrics
+    finally:
+        population_connection.close()
 
     deltapeso=round(dinamicodata[-1][13]*1000)
     deltapg=round(dinamicodata[-1][15]*1000)
@@ -364,7 +564,7 @@ def dashboard():
     # Obtener el plan de entrenamiento
     training_plan = functions.get_training_plan(user_dni)
 
-    return render_template('dashboard.html', dieta=dietadata, dinamico=dinamicodata, estatico=estaticodata, objetivo=objetivodata, title='Vista Principal', username=session['username'], agua=agua, abdomen=abdomen, abdcatrisk=abdcatrisk, bodyscore=bodyscore, categoria=categoria, habitperformance=habitperformance, deltapeso=deltapeso, deltapg=deltapg, deltapm=deltapm, ffmi=ffmi, imc=imc, bf=bf, deltaimc=deltaimc, listaimc=listaimc, deltaffmi=deltaffmi, listaffmi=listaffmi, deltabf=deltabf, listabf=listabf, bfcat=bfcat, immccat=immccat, imccat=imccat, solver_category=solver_category, training_plan=training_plan)
+    return render_template('dashboard.html', dieta=dietadata, dinamico=dinamicodata, estatico=estaticodata, objetivo=objetivodata, title='Vista Principal', username=session['username'], agua=agua, abdomen=abdomen, abdcatrisk=abdcatrisk, bodyscore=bodyscore, categoria=categoria, habitperformance=habitperformance, deltapeso=deltapeso, deltapg=deltapg, deltapm=deltapm, ffmi=ffmi, imc=imc, bf=bf, deltaimc=deltaimc, listaimc=listaimc, deltaffmi=deltaffmi, listaffmi=listaffmi, deltabf=deltabf, listabf=listabf, bfcat=bfcat, immccat=immccat, imccat=imccat, solver_category=solver_category, training_plan=training_plan, performance_clock=performance_clock, fatrate_target=fatrate_target, leanrate_target=leanrate_target)
 
 ### FUNCIÓN DE MANTENIMIENTO ###
 
